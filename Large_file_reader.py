@@ -1,116 +1,266 @@
 """
-Large File Handling Tools - LangChain tool wrappers for the agent.
+Agentic File Reader - Chunks and summarizes large files to answer questions.
 
-These tools are imported by agent.py and added to ALL_TOOLS.
-
-Place this file at: tools/large_file_tools.py
-
-Dependencies (these must also be in tools/):
-    - tools/large_file_reader.py    → AgenticFileReader
-    - tools/ansible_log_reader.py   → AnsibleLogReader
-    - tools/ansible_log_chunker.py  → AnsibleLogChunker
-    - tools/ansible_log_extractor.py → AnsibleLogExtractor
+Place this file at: tools/large_file_reader.py
 """
 
-import json
-from typing import Annotated
-from langchain_core.tools import tool
+import os
+from typing import TypedDict, List
 
-from tools.large_file_reader import AgenticFileReader
-from tools.ansible_log_reader import AnsibleLogReader
-from tools.ansible_log_chunker import AnsibleLogChunker
-from tools.ansible_log_extractor import AnsibleLogExtractor
-
-
-@tool
-def query_large_file(
-    file_path: Annotated[str, "Path to the large file to analyze"],
-    question: Annotated[str, "Question to ask about the file content"],
-) -> str:
-    """Analyze a large file (that might exceed context limits) by chunking and summarizing it to answer a question.
-
-    Use this tool when:
-    - You need to read a file that is too large for standard read_file
-    - You need to ask complex questions about a large document
-    - Standard analysis fails due to token limits
-    """
-    try:
-        reader = AgenticFileReader()
-        return reader.query(file_path, question)
-    except Exception as e:
-        return f"Error analyzing large file: {str(e)}"
+from langgraph.graph import StateGraph, END
+from langchain_litellm import ChatLiteLLM
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.prompts import ChatPromptTemplate
 
 
-@tool
-def query_ansible_log(
-    file_path: Annotated[str, "Path to the Ansible log file"],
-    question: Annotated[
-        str,
-        "Question about the Ansible execution (e.g. 'what failed?', 'summary')",
-    ],
-) -> str:
-    """Analyze an Ansible log file to answer questions about the execution.
+# ============================================================
+# STATE
+# ============================================================
 
-    Use this tool for:
-    - determining why a playbook failed
-    - finding which hosts changed
-    - getting a summary of the execution
-    - analyzing specific tasks or errors
-    """
-    try:
-        reader = AnsibleLogReader()
-        return reader.query(file_path, question)
-    except Exception as e:
-        return f"Error analyzing Ansible log: {str(e)}"
+class FileState(TypedDict):
+    # Input
+    file_path: str
+    question: str
+
+    # Processing
+    content: str
+    is_large: bool
+    chunks: List[str]
+    chunk_summaries: List[str]
+
+    # Output
+    answer: str
 
 
-@tool
-def extract_ansible_metrics(
-    file_path: Annotated[str, "Path to the Ansible log file"],
-    extraction_type: Annotated[
-        str,
-        "Type of extraction: 'failed_tasks', 'timeline', 'by_host:<hostname>', 'by_play:<playname>'",
-    ],
-) -> str:
-    """Extract specific structured data from an Ansible log file.
+# ============================================================
+# AGENT
+# ============================================================
 
-    This tool does NOT use LLM calls - it parses the log directly.
+class AgenticFileReader:
+    def __init__(self, model: str | None = None):
+        llm_name = model or os.getenv("LLM_NAME", "anthropic/bedrock-sonnet-4-5")
+        api_key = os.getenv("LITELLM_API_KEY", os.getenv("ANTHROPIC_API_KEY", ""))
+        api_url = os.getenv("LITELLM_API_BASE", os.getenv("ANTHROPIC_API_URL", ""))
 
-    Args:
-        file_path: Path to the Ansible log file.
-        extraction_type: What to extract. Options:
-            - 'failed_tasks': Get all failed tasks with error messages
-            - 'timeline': Get chronological execution timeline
-            - 'by_host:<hostname>': Get all tasks for a specific host
-            - 'by_play:<playname>': Get all tasks from a specific play
-    """
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
+        llm_kwargs = {
+            "model": llm_name,
+            "api_key": api_key,
+            "max_tokens": 4096,
+            "drop_params": True,
+        }
+        if api_url:
+            llm_kwargs["api_base"] = api_url
+
+        self.llm = ChatLiteLLM(**llm_kwargs)
+        self.splitter = RecursiveCharacterTextSplitter(
+            chunk_size=3000,
+            chunk_overlap=150,
+        )
+        self.graph = self._build_graph()
+
+    # --------------------------------------------------------
+    # NODE 1: Load File
+    # --------------------------------------------------------
+    def load_file(self, state: FileState) -> FileState:
+        """Load file and check size."""
+        print(f"📂 Loading: {state['file_path']}")
+
+        with open(state["file_path"], "r", encoding="utf-8") as f:
             content = f.read()
 
-        chunker = AnsibleLogChunker()
-        extractor = AnsibleLogExtractor(chunker)
+        is_large = len(content) > 8000
+        print(f"   {'Large' if is_large else 'Small'} file ({len(content)} chars)")
 
-        if extraction_type == "failed_tasks":
-            result = extractor.extract_failed_tasks_only(content)
-        elif extraction_type == "timeline":
-            result = extractor.get_execution_timeline(content)
-        elif extraction_type.startswith("by_host:"):
-            host = extraction_type.split(":", 1)[1]
-            result = extractor.extract_by_host(content, host)
-        elif extraction_type.startswith("by_play:"):
-            play = extraction_type.split(":", 1)[1]
-            result = extractor.extract_by_play(content, play)
-        else:
-            return (
-                f"Unknown extraction type: {extraction_type}. "
-                f"Valid options: 'failed_tasks', 'timeline', 'by_host:<hostname>', 'by_play:<playname>'"
+        return {
+            **state,
+            "content": content,
+            "is_large": is_large,
+        }
+
+    # --------------------------------------------------------
+    # ROUTER: Small or Large?
+    # --------------------------------------------------------
+    def route_by_size(self, state: FileState) -> str:
+        """Decide which path to take."""
+        return "large" if state["is_large"] else "small"
+
+    # --------------------------------------------------------
+    # NODE 2a: Small File - Skip to Answer
+    # --------------------------------------------------------
+    def handle_small(self, state: FileState) -> FileState:
+        """Small files don't need chunking."""
+        print("✓ Small file - answering directly")
+        return state
+
+    # --------------------------------------------------------
+    # NODE 2b: Large File - Chunk and Summarize
+    # --------------------------------------------------------
+    def handle_large(self, state: FileState) -> FileState:
+        """Chunk and summarize large files."""
+        print("📄 Chunking large file...")
+
+        chunks = self.splitter.split_text(state["content"])
+        print(f"   Split into {len(chunks)} chunks")
+
+        summaries = []
+        for i, chunk in enumerate(chunks, 1):
+            prompt = ChatPromptTemplate.from_template(
+                "Summarize in 1-2 sentences:\n\n{text}"
             )
+            summary = self.llm.invoke(prompt.format(text=chunk)).content
+            summaries.append(summary)
+            print(f"   Summarized {i}/{len(chunks)}")
 
-        if not result:
-            return f"No results found for extraction type '{extraction_type}'."
+        return {
+            **state,
+            "chunks": chunks,
+            "chunk_summaries": summaries,
+        }
 
-        return json.dumps(result, indent=2, default=str)
+    # --------------------------------------------------------
+    # NODE 3: Answer Question
+    # --------------------------------------------------------
+    def answer(self, state: FileState) -> FileState:
+        """Answer the question."""
+        print(f"💭 Answering: {state['question']}")
 
-    except Exception as e:
-        return f"Error extracting metrics: {str(e)}"
+        if state["is_large"]:
+            answer = self._answer_large_file(state)
+        else:
+            answer = self._answer_small_file(state)
+
+        print("✓ Answer generated")
+
+        return {**state, "answer": answer}
+
+    def _answer_small_file(self, state: FileState) -> str:
+        """Answer from full content."""
+        prompt = ChatPromptTemplate.from_template(
+            """Answer based on this content:
+
+{content}
+
+Question: {question}
+
+Answer:"""
+        )
+
+        return self.llm.invoke(
+            prompt.format(content=state["content"], question=state["question"])
+        ).content
+
+    def _answer_large_file(self, state: FileState) -> str:
+        """Two-step: find relevant chunks, then answer."""
+
+        summaries_text = "\n\n".join(
+            [
+                f"Chunk {i + 1}: {summary}"
+                for i, summary in enumerate(state["chunk_summaries"])
+            ]
+        )
+
+        find_prompt = ChatPromptTemplate.from_template(
+            """Which chunks are relevant to the question?
+
+Summaries:
+{summaries}
+
+Question: {question}
+
+List chunk numbers (e.g., "1, 3, 5"):"""
+        )
+
+        relevant_str = self.llm.invoke(
+            find_prompt.format(summaries=summaries_text, question=state["question"])
+        ).content
+
+        try:
+            chunk_nums = [
+                int(n.strip()) - 1
+                for n in relevant_str.replace(",", " ").split()
+                if n.strip().isdigit()
+            ]
+            chunk_nums = [n for n in chunk_nums if 0 <= n < len(state["chunks"])]
+        except Exception:
+            chunk_nums = [0]
+
+        if not chunk_nums:
+            chunk_nums = [0]
+
+        print(f"   Using chunks: {[n + 1 for n in chunk_nums[:5]]}")
+
+        relevant_content = "\n\n---\n\n".join(
+            [
+                f"[Section {i + 1}]\n{state['chunks'][i]}"
+                for i in chunk_nums[:5]
+            ]
+        )
+
+        answer_prompt = ChatPromptTemplate.from_template(
+            """Answer based on these sections:
+
+{content}
+
+Question: {question}
+
+Answer:"""
+        )
+
+        return self.llm.invoke(
+            answer_prompt.format(content=relevant_content, question=state["question"])
+        ).content
+
+    # --------------------------------------------------------
+    # Build Graph
+    # --------------------------------------------------------
+    def _build_graph(self) -> StateGraph:
+        """Create the workflow."""
+        workflow = StateGraph(FileState)
+
+        workflow.add_node("load", self.load_file)
+        workflow.add_node("small", self.handle_small)
+        workflow.add_node("large", self.handle_large)
+        workflow.add_node("answer", self.answer)
+
+        workflow.set_entry_point("load")
+
+        workflow.add_conditional_edges(
+            "load",
+            self.route_by_size,
+            {"small": "small", "large": "large"},
+        )
+
+        workflow.add_edge("small", "answer")
+        workflow.add_edge("large", "answer")
+        workflow.add_edge("answer", END)
+
+        return workflow.compile()
+
+    # --------------------------------------------------------
+    # Public Interface
+    # --------------------------------------------------------
+    def query(self, file_path: str, question: str) -> str:
+        """Ask a question about a file."""
+        print("\n" + "=" * 60)
+        print(f"Question: {question}")
+        print("=" * 60 + "\n")
+
+        result = self.graph.invoke(
+            {
+                "file_path": file_path,
+                "question": question,
+                "content": "",
+                "is_large": False,
+                "chunks": [],
+                "chunk_summaries": [],
+                "answer": "",
+            }
+        )
+
+        print("\n" + "=" * 60)
+        print("Answer:")
+        print("=" * 60)
+        print(result["answer"])
+        print()
+
+        return result["answer"]
